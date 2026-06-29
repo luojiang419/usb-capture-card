@@ -5,7 +5,7 @@
 当前版本：`1.4.0`  
 应用包名：`com.codex.usbcapture`  
 最低系统版本：Android 6.0，API 23  
-发布 APK：见 GitHub Releases 中的 `USB采集卡.apk`
+发布 APK：见 GitHub Releases 中的 `USB-Capture-Card-v1.4.0.apk`
 
 ## 主要功能
 
@@ -27,7 +27,7 @@
 
 ## 使用方式
 
-1. 在 GitHub Releases 下载最新的 `USB采集卡.apk`。
+1. 在 GitHub Releases 下载最新的 `USB-Capture-Card-v1.4.0.apk`。
 2. 将 APK 安装到支持 USB Host 的 Android 手机或平板。
 3. 使用 OTG 转接线连接 USB/HDMI 采集卡。
 4. 首次连接时授予 USB 设备权限、相机权限和录音权限。
@@ -133,6 +133,8 @@ macOS / Linux：
 ```text
 app/build/outputs/apk/debug/USB采集卡.apk
 ```
+
+说明：本地构建产物使用中文文件名 `USB采集卡.apk`；GitHub Release 中使用更稳定的英文资产名 `USB-Capture-Card-v1.4.0.apk`。
 
 ## 权限说明
 
