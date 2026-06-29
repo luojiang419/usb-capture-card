@@ -1,0 +1,21 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+app/build/
+
+# Local IDE and machine files
+.idea/
+*.iml
+local.properties
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# APK outputs are published through GitHub Releases, not committed.
+*.apk
