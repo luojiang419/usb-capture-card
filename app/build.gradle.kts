@@ -5,6 +5,16 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val signingStoreFilePath = System.getenv("ANDROID_SIGNING_STORE_FILE")
+val signingStorePassword = System.getenv("ANDROID_SIGNING_STORE_PASSWORD")
+val signingKeyAlias = System.getenv("ANDROID_SIGNING_KEY_ALIAS")
+val signingKeyPassword = System.getenv("ANDROID_SIGNING_KEY_PASSWORD")
+val hasCustomSigning =
+    !signingStoreFilePath.isNullOrBlank() &&
+        !signingStorePassword.isNullOrBlank() &&
+        !signingKeyAlias.isNullOrBlank() &&
+        !signingKeyPassword.isNullOrBlank()
+
 android {
     namespace = "com.codex.usbcapture"
     compileSdk = 36
@@ -14,7 +24,7 @@ android {
         minSdk = 23
         targetSdk = 36
         versionCode = 8
-        versionName = "1.4.3"
+        versionName = "1.4.4"
     }
 
     buildFeatures {
@@ -33,6 +43,29 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    signingConfigs {
+        if (hasCustomSigning) {
+            create("ciRelease") {
+                storeFile = file(signingStoreFilePath!!)
+                storePassword = signingStorePassword
+                keyAlias = signingKeyAlias
+                keyPassword = signingKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = false
+            isShrinkResources = false
+            signingConfig = if (hasCustomSigning) {
+                signingConfigs.getByName("ciRelease")
+            } else {
+                signingConfigs.getByName("debug")
+            }
+        }
     }
 
     applicationVariants.all {

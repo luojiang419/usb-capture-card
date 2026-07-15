@@ -49,8 +49,34 @@ jobs:
       - name: Ensure Gradle wrapper is executable
         run: chmod +x ./gradlew
 
-      - name: Build debug APK
-        run: ./gradlew --no-daemon :app:assembleDebug
+      - name: Validate Android signing secrets
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.USB_CAPTURE_ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.USB_CAPTURE_ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.USB_CAPTURE_ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.USB_CAPTURE_ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "${ANDROID_KEYSTORE_BASE64}" || { echo "Missing secret: USB_CAPTURE_ANDROID_KEYSTORE_BASE64"; exit 1; }
+          test -n "${ANDROID_KEYSTORE_PASSWORD}" || { echo "Missing secret: USB_CAPTURE_ANDROID_KEYSTORE_PASSWORD"; exit 1; }
+          test -n "${ANDROID_KEY_ALIAS}" || { echo "Missing secret: USB_CAPTURE_ANDROID_KEY_ALIAS"; exit 1; }
+          test -n "${ANDROID_KEY_PASSWORD}" || { echo "Missing secret: USB_CAPTURE_ANDROID_KEY_PASSWORD"; exit 1; }
+
+      - name: Decode Android signing keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.USB_CAPTURE_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          KEYSTORE_PATH="${RUNNER_TEMP}/usb-capture-signing.keystore"
+          printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${KEYSTORE_PATH}"
+          echo "ANDROID_SIGNING_STORE_FILE=${KEYSTORE_PATH}" >> "${GITHUB_ENV}"
+
+      - name: Build signed release APK
+        env:
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.USB_CAPTURE_ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.USB_CAPTURE_ANDROID_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.USB_CAPTURE_ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon :app:assembleRelease
 
       - name: Prepare release asset
         id: asset
@@ -59,7 +85,7 @@ jobs:
           TAG_NAME="${GITHUB_REF_NAME}"
           RELEASE_APK="USB-Capture-Card-${TAG_NAME}.apk"
           RELEASE_APK_PATH="${RUNNER_TEMP}/${RELEASE_APK}"
-          cp "app/build/outputs/apk/debug/USB采集卡.apk" "${RELEASE_APK_PATH}"
+          cp "app/build/outputs/apk/release/USB采集卡.apk" "${RELEASE_APK_PATH}"
           echo "release_apk=${RELEASE_APK}" >> "${GITHUB_OUTPUT}"
           echo "release_apk_path=${RELEASE_APK_PATH}" >> "${GITHUB_OUTPUT}"
 
