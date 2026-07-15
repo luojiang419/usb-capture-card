@@ -2,7 +2,7 @@
 
 一个面向 Android 设备的 USB/UVC 采集卡预览与录制应用。项目使用 Kotlin、Jetpack Compose 和 AUSBC 3.2.7 构建，目标是让手机或平板连接 USB 采集卡后，可以快速查看 HDMI/采集画面、切换采集参数并录制视频。
 
-当前版本：`1.4.0`  
+当前版本：`1.4.1`  
 应用包名：`com.codex.usbcapture`  
 最低系统版本：Android 6.0，API 23  
 发布 APK：见 GitHub Releases 中最新标签对应的 `USB-Capture-Card-v版本号.apk`
@@ -147,7 +147,7 @@ app/build/outputs/apk/debug/USB采集卡.apk
 
 ## 当前版本能力
 
-`1.4.0` 版本包含以下重点优化：
+`1.4.1` 版本包含以下重点优化：
 
 - 左上角只保留功能按钮，不再重复显示“等待采集卡”状态胶囊。
 - 功能按钮内增加状态指示灯。
