@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Matrix
 import android.hardware.usb.UsbDevice
 import android.os.Build
 import android.os.Bundle
@@ -11,6 +12,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -34,6 +36,11 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -79,6 +86,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -86,6 +94,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.text.font.FontWeight
@@ -94,6 +103,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.view.doOnLayout
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -115,12 +125,20 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.delay
 
 private const val DEFAULT_FRAME_RATE = 30
 private const val CONTROLS_AUTO_HIDE_MS = 3000L
+private const val FIRST_FRAME_TIMEOUT_MS = 5000L
+private const val FRAME_STALL_TIMEOUT_MS = 3500L
+private const val PREVIEW_WATCHDOG_INTERVAL_MS = 1000L
+private const val MAX_PREVIEW_RECOVERY_ATTEMPTS = 1
+private const val MIN_PREVIEW_ZOOM = 1f
+private const val MAX_PREVIEW_ZOOM = 5f
+private const val PREVIEW_ZOOM_SNAP_THRESHOLD = 1.03f
+private const val TAG = "UsbCapture"
 private val FRAME_RATE_OPTIONS = listOf(24, 30, 60)
-private val PREVIEW_SIZE_ASPECT_RATIOS = listOf<Double?>(null, 16.0 / 9.0, 4.0 / 3.0, 1.0, 5.0 / 4.0)
 
 class MainActivity : CameraActivity() {
     private lateinit var root: FrameLayout
@@ -131,10 +149,23 @@ class MainActivity : CameraActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var recordingStartedAt = 0L
     private var activeRecordingFile: File? = null
-    private var previewFrameCount = 0
+    private val previewFrameCount = AtomicInteger(0)
+    @Volatile
     private var previewFpsStartedAt = 0L
     @Volatile
     private var previewFpsEnabled = false
+    @Volatile
+    private var firstPreviewFrameReceived = false
+    @Volatile
+    private var lastPreviewFrameAt = 0L
+    private var previewRecoveryAttempts = 0
+    private var previewRecoveryInProgress = false
+    private var cachedPreviewSizes: List<PreviewOption> = emptyList()
+    private val previewTransformMatrix = Matrix()
+    private var previewZoom = MIN_PREVIEW_ZOOM
+    private var isPreviewZoomed by mutableStateOf(false)
+    private var previewPanX = 0f
+    private var previewPanY = 0f
 
     private var themeMode by mutableStateOf(ThemeMode.System)
     private var showControls by mutableStateOf(true)
@@ -144,17 +175,35 @@ class MainActivity : CameraActivity() {
     private var controlsInteractionTick by mutableStateOf(0)
     private var screenOrientation by mutableStateOf(ScreenOrientation.Portrait)
     private var uiState by mutableStateOf(UsbCameraUiState())
-    private val permissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { result ->
-        val granted = requiredRuntimePermissions().all { result[it] == true }
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
         if (granted) {
-            openCameraOnPermissionGranted()
+            Log.i(TAG, "Camera permission granted")
+            openCameraAfterPermissionGrant()
         } else {
+            Log.w(TAG, "Camera permission denied")
             uiState = uiState.copy(
                 connectionState = DeviceConnectionState.Error,
-                statusText = "缺少相机或录音权限",
-                errorMessage = "缺少相机或录音权限"
+                statusText = "缺少相机权限",
+                errorMessage = "缺少相机权限，无法显示采集画面",
+                diagnosticText = "应用层：相机权限未授权"
+            )
+        }
+    }
+    private val audioPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted && uiState.isPreviewing && !uiState.isRecording) {
+            Log.i(TAG, "Audio permission granted, starting recording")
+            startRecording()
+            hideControlsForPreview()
+        } else if (!granted) {
+            Log.w(TAG, "Audio permission denied")
+            revealControls()
+            uiState = uiState.copy(
+                statusText = "录制需要录音权限",
+                errorMessage = "录音权限被拒绝，实时预览仍可正常使用"
             )
         }
     }
@@ -167,7 +216,7 @@ class MainActivity : CameraActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         onBackPressedDispatcher.addCallback(this, createBackCallback())
         refreshRecordingFiles()
-        ensureRuntimePermissions()
+        ensureCameraPermission()
         enterImmersiveMode()
     }
 
@@ -183,6 +232,7 @@ class MainActivity : CameraActivity() {
         }
         stopRecordingTicker()
         stopPreviewFps()
+        mainHandler.removeCallbacks(previewWatchdog)
         super.onDestroy()
     }
 
@@ -194,7 +244,9 @@ class MainActivity : CameraActivity() {
     }
 
     override fun getRootView(layoutInflater: LayoutInflater): View {
-        root = FrameLayout(this)
+        root = FrameLayout(this).apply {
+            setBackgroundColor(android.graphics.Color.BLACK)
+        }
         cameraContainer = FrameLayout(this)
         val composeOverlay = ComposeView(this).apply {
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
@@ -208,6 +260,7 @@ class MainActivity : CameraActivity() {
                         functionMenuExpanded = showFunctionMenu,
                         showSettings = showSettings,
                         screenLocked = isScreenLocked,
+                        singleFingerPanEnabled = isPreviewZoomed,
                         controlsInteractionTick = controlsInteractionTick,
                         onThemeModeChange = ::switchTheme,
                         onRecordClick = ::handleRecordClick,
@@ -219,6 +272,7 @@ class MainActivity : CameraActivity() {
                         onSettingsDismiss = ::dismissCaptureSettings,
                         onExitClick = ::exitCaptureScreen,
                         onPreviewTap = ::handlePreviewTap,
+                        onPreviewTransform = ::handlePreviewTransform,
                         onAutoHideControls = ::autoHideControls,
                         onToggleScreenLock = ::toggleScreenLock
                     )
@@ -284,17 +338,24 @@ class MainActivity : CameraActivity() {
     }
 
     private fun handleCameraStatus(status: CameraStatus) {
-        val details = collectUsbDetails()
+        Log.i(TAG, "Camera status code=${status.code}, message=${status.message.orEmpty()}")
+        val details = collectUsbDetails(
+            refreshPreviewSizes = status.code == CameraStatus.START ||
+                status.code == CameraStatus.ERROR_PREVIEW_SIZE
+        )
         uiState = when (status.code) {
             CameraStatus.START -> {
+                previewRecoveryInProgress = false
                 resetPreviewFps()
+                refreshRenderSize()
                 hideControlsForPreview()
                 uiState.copy(
-                    connectionState = DeviceConnectionState.Connected,
-                    statusText = "视频信号已连接",
+                    connectionState = DeviceConnectionState.Connecting,
+                    statusText = "相机已启动，正在等待视频帧",
                     isPreviewing = true,
                     captureFps = 0,
                     errorMessage = null,
+                    diagnosticText = "采集层：等待首帧（最长 5 秒）",
                     deviceName = details.deviceName,
                     previewSizeText = details.previewSizeText,
                     previewSizes = details.previewSizes
@@ -302,17 +363,30 @@ class MainActivity : CameraActivity() {
             }
             CameraStatus.STOP -> {
                 stopPreviewFps()
-                isScreenLocked = false
-                revealControls()
-                uiState.copy(
-                    connectionState = DeviceConnectionState.Waiting,
-                    statusText = "等待采集卡",
-                    isPreviewing = false,
-                    isRecording = false,
-                    captureFps = 0,
-                    deviceName = details.deviceName,
-                    previewSizes = details.previewSizes
-                )
+                if (previewRecoveryInProgress) {
+                    uiState.copy(
+                        connectionState = DeviceConnectionState.Connecting,
+                        statusText = "正在重新启动采集画面",
+                        isPreviewing = false,
+                        isRecording = false,
+                        captureFps = 0,
+                        diagnosticText = "采集层：自动恢复进行中",
+                        deviceName = details.deviceName,
+                        previewSizes = details.previewSizes
+                    )
+                } else {
+                    showMainScreenChrome()
+                    uiState.copy(
+                        connectionState = DeviceConnectionState.Waiting,
+                        statusText = "等待采集卡",
+                        isPreviewing = false,
+                        isRecording = false,
+                        captureFps = 0,
+                        diagnosticText = "采集层：预览已停止",
+                        deviceName = details.deviceName,
+                        previewSizes = details.previewSizes
+                    )
+                }
             }
             CameraStatus.ERROR_PREVIEW_SIZE -> {
                 stopPreviewFps()
@@ -322,13 +396,13 @@ class MainActivity : CameraActivity() {
                     connectionState = DeviceConnectionState.Connecting,
                     statusText = "正在匹配可用分辨率",
                     errorMessage = localizeCameraMessage(status.message, "正在匹配可用分辨率"),
+                    diagnosticText = "采集层：当前分辨率不可用",
                     previewSizes = details.previewSizes
                 )
             }
             else -> {
                 stopPreviewFps()
-                isScreenLocked = false
-                revealControls()
+                showMainScreenChrome()
                 uiState.copy(
                     connectionState = DeviceConnectionState.Error,
                     statusText = "连接失败",
@@ -336,6 +410,7 @@ class MainActivity : CameraActivity() {
                     isRecording = false,
                     captureFps = 0,
                     errorMessage = localizeCameraMessage(status.message, "未知错误"),
+                    diagnosticText = "采集层：相机启动失败（状态码 ${status.code}）",
                     deviceName = details.deviceName,
                     previewSizes = details.previewSizes
                 )
@@ -352,6 +427,12 @@ class MainActivity : CameraActivity() {
         }
         if (uiState.isRecording) {
             stopRecording()
+        } else if (!hasPermission(Manifest.permission.RECORD_AUDIO)) {
+            uiState = uiState.copy(
+                statusText = "等待录音权限",
+                errorMessage = null
+            )
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         } else {
             startRecording()
         }
@@ -367,6 +448,7 @@ class MainActivity : CameraActivity() {
     }
 
     private fun updateResolution(option: PreviewOption) {
+        resetPreviewTransform()
         val changed = cameraClient?.updateResolution(option.width, option.height) == true
         uiState = uiState.copy(
             connectionState = if (changed) DeviceConnectionState.Connecting else uiState.connectionState,
@@ -386,13 +468,12 @@ class MainActivity : CameraActivity() {
     }
 
     private fun detectPreviewSizes(): List<PreviewOption> {
-        val client = cameraClient ?: return emptyList()
+        val client = cameraClient ?: return cachedPreviewSizes
         val sizes = linkedSetOf<PreviewOption>()
-        PREVIEW_SIZE_ASPECT_RATIOS.forEach { ratio ->
-            runCatching { client.getAllPreviewSizes(ratio) }
-                .getOrNull()
-                ?.mapTo(sizes) { PreviewOption(it.width, it.height) }
-        }
+        runCatching { client.getAllPreviewSizes(null) }
+            .onFailure { Log.w(TAG, "Preview size query failed", it) }
+            .getOrNull()
+            ?.mapTo(sizes) { PreviewOption(it.width, it.height) }
         val request = client.getCameraRequest()
         if (request != null) {
             sizes.add(PreviewOption(request.previewWidth, request.previewHeight))
@@ -400,6 +481,7 @@ class MainActivity : CameraActivity() {
         return sizes
             .filter { it.width > 0 && it.height > 0 }
             .sortedWith(compareByDescending<PreviewOption> { it.width * it.height }.thenByDescending { it.width })
+            .also { cachedPreviewSizes = it }
     }
 
     private fun updateFrameRate(frameRate: Int) {
@@ -493,6 +575,15 @@ class MainActivity : CameraActivity() {
         enterImmersiveMode()
     }
 
+    private fun showMainScreenChrome() {
+        isScreenLocked = false
+        showFunctionMenu = false
+        showSettings = false
+        showControls = true
+        markControlsInteraction()
+        exitImmersiveMode()
+    }
+
     private fun enterImmersiveMode() {
         WindowInsetsControllerCompat(window, window.decorView).apply {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -500,9 +591,65 @@ class MainActivity : CameraActivity() {
         }
     }
 
+    private fun exitImmersiveMode() {
+        WindowInsetsControllerCompat(window, window.decorView)
+            .show(WindowInsetsCompat.Type.systemBars())
+    }
+
     private fun handlePreviewTap() {
         if (!uiState.isPreviewing || showSettings || isScreenLocked) return
         revealControls()
+    }
+
+    private fun handlePreviewTransform(
+        zoomChange: Float,
+        panChangeX: Float,
+        panChangeY: Float,
+        centroidX: Float,
+        centroidY: Float
+    ) {
+        if (!uiState.isPreviewing || isScreenLocked || !::cameraView.isInitialized) return
+        if (
+            !zoomChange.isFinite() ||
+            zoomChange <= 0f ||
+            !panChangeX.isFinite() ||
+            !panChangeY.isFinite() ||
+            !centroidX.isFinite() ||
+            !centroidY.isFinite()
+        ) return
+        val oldZoom = previewZoom
+        val scaledZoom = (oldZoom * zoomChange).coerceIn(MIN_PREVIEW_ZOOM, MAX_PREVIEW_ZOOM)
+        val newZoom = if (scaledZoom <= PREVIEW_ZOOM_SNAP_THRESHOLD) {
+            MIN_PREVIEW_ZOOM
+        } else {
+            scaledZoom
+        }
+        val appliedZoomChange = newZoom / oldZoom
+        val localCentroidX = centroidX - cameraView.left
+        val localCentroidY = centroidY - cameraView.top
+        val centerX = cameraView.width / 2f
+        val centerY = cameraView.height / 2f
+        previewPanX = previewPanX * appliedZoomChange +
+            (1f - appliedZoomChange) * (localCentroidX - centerX) + panChangeX
+        previewPanY = previewPanY * appliedZoomChange +
+            (1f - appliedZoomChange) * (localCentroidY - centerY) + panChangeY
+        previewZoom = newZoom
+        isPreviewZoomed = newZoom > MIN_PREVIEW_ZOOM
+        if (!isPreviewZoomed) {
+            previewPanX = 0f
+            previewPanY = 0f
+        }
+        applyPreviewTransform(cameraView.width, cameraView.height)
+    }
+
+    private fun resetPreviewTransform() {
+        previewZoom = MIN_PREVIEW_ZOOM
+        isPreviewZoomed = false
+        previewPanX = 0f
+        previewPanY = 0f
+        if (::cameraView.isInitialized && cameraView.width > 0 && cameraView.height > 0) {
+            applyPreviewTransform(cameraView.width, cameraView.height)
+        }
     }
 
     private fun autoHideControls() {
@@ -530,28 +677,62 @@ class MainActivity : CameraActivity() {
 
     private fun resetPreviewFps() {
         previewFpsEnabled = true
-        previewFrameCount = 0
+        firstPreviewFrameReceived = false
+        lastPreviewFrameAt = 0L
+        previewFrameCount.set(0)
         previewFpsStartedAt = SystemClock.elapsedRealtime()
         uiState = uiState.copy(captureFps = 0)
+        mainHandler.removeCallbacks(previewWatchdog)
+        mainHandler.postDelayed(previewWatchdog, PREVIEW_WATCHDOG_INTERVAL_MS)
     }
 
     private fun stopPreviewFps() {
         previewFpsEnabled = false
-        previewFrameCount = 0
+        firstPreviewFrameReceived = false
+        lastPreviewFrameAt = 0L
+        previewFrameCount.set(0)
         previewFpsStartedAt = 0L
+        mainHandler.removeCallbacks(previewWatchdog)
     }
 
-    private fun onPreviewFrameArrived() {
+    private fun onPreviewFrameArrived(
+        data: ByteArray,
+        format: IPreviewDataCallBack.DataFormat
+    ) {
         if (!previewFpsEnabled) return
         val now = SystemClock.elapsedRealtime()
+        val isFirstFrame = !firstPreviewFrameReceived
+        firstPreviewFrameReceived = true
+        lastPreviewFrameAt = now
+        if (isFirstFrame) {
+            val averageLuma = estimateAverageLuma(data)
+            Log.i(
+                TAG,
+                "First preview frame format=$format, bytes=${data.size}, averageLuma=$averageLuma"
+            )
+            runOnUiThread {
+                if (previewFpsEnabled && uiState.isPreviewing) {
+                    hideControlsForPreview()
+                    uiState = uiState.copy(
+                        connectionState = DeviceConnectionState.Connected,
+                        statusText = "视频帧已连接",
+                        errorMessage = null,
+                        diagnosticText = if (averageLuma <= 24) {
+                            "帧流已到达，但内容接近黑场（亮度 $averageLuma）"
+                        } else {
+                            "帧流正常（$format，亮度 $averageLuma）"
+                        }
+                    )
+                }
+            }
+        }
         if (previewFpsStartedAt == 0L) {
             previewFpsStartedAt = now
         }
-        previewFrameCount += 1
+        previewFrameCount.incrementAndGet()
         val elapsed = now - previewFpsStartedAt
         if (elapsed >= 1000L) {
-            val fps = ((previewFrameCount * 1000L) / elapsed).toInt()
-            previewFrameCount = 0
+            val fps = ((previewFrameCount.getAndSet(0) * 1000L) / elapsed).toInt()
             previewFpsStartedAt = now
             runOnUiThread {
                 if (uiState.isPreviewing) {
@@ -561,9 +742,89 @@ class MainActivity : CameraActivity() {
         }
     }
 
+    private fun estimateAverageLuma(data: ByteArray): Int {
+        val lumaSize = data.size * 2 / 3
+        if (lumaSize <= 0) return 0
+        val sampleStep = maxOf(1, lumaSize / 512)
+        var sum = 0L
+        var samples = 0
+        var index = 0
+        while (index < lumaSize) {
+            sum += data[index].toInt() and 0xFF
+            samples += 1
+            index += sampleStep
+        }
+        return if (samples == 0) 0 else (sum / samples).toInt()
+    }
+
+    private val previewWatchdog = object : Runnable {
+        override fun run() {
+            if (!previewFpsEnabled) return
+            val now = SystemClock.elapsedRealtime()
+            val receivedFrame = firstPreviewFrameReceived
+            val referenceTime = if (receivedFrame) lastPreviewFrameAt else previewFpsStartedAt
+            val timeout = if (receivedFrame) FRAME_STALL_TIMEOUT_MS else FIRST_FRAME_TIMEOUT_MS
+            if (referenceTime > 0L && now - referenceTime >= timeout) {
+                handlePreviewTimeout(receivedFrame)
+                return
+            }
+            mainHandler.postDelayed(this, PREVIEW_WATCHDOG_INTERVAL_MS)
+        }
+    }
+
+    private fun handlePreviewTimeout(hadFrames: Boolean) {
+        val reason = if (hadFrames) "preview frame stream stalled" else "first preview frame timed out"
+        Log.w(
+            TAG,
+            "$reason, cameraOpened=${cameraClient?.isCameraOpened()}, recovery=$previewRecoveryAttempts"
+        )
+        if (!uiState.isRecording && previewRecoveryAttempts < MAX_PREVIEW_RECOVERY_ATTEMPTS) {
+            previewRecoveryAttempts += 1
+            previewRecoveryInProgress = true
+            uiState = uiState.copy(
+                connectionState = DeviceConnectionState.Connecting,
+                statusText = "画面异常，正在自动恢复",
+                captureFps = 0,
+                errorMessage = null,
+                diagnosticText = if (hadFrames) {
+                    "采集层：视频帧中断，执行第 1 次恢复"
+                } else {
+                    "采集层：相机已启动但无首帧，执行第 1 次恢复"
+                }
+            )
+            val request = cameraClient?.getCameraRequest()
+            val restarted = request != null &&
+                cameraClient?.updateResolution(request.previewWidth, request.previewHeight) == true
+            if (restarted) return
+            previewRecoveryInProgress = false
+            Log.e(TAG, "Preview recovery request failed")
+        }
+
+        showMainScreenChrome()
+        firstPreviewFrameReceived = false
+        lastPreviewFrameAt = 0L
+        uiState = uiState.copy(
+            connectionState = DeviceConnectionState.Error,
+            statusText = "采集画面异常",
+            captureFps = 0,
+            errorMessage = if (hadFrames) {
+                "视频帧已中断，请检查 USB 供电、线材或重新插拔采集卡"
+            } else {
+                "相机已打开但未收到视频帧，请检查采集卡输入信号"
+            },
+            diagnosticText = if (hadFrames) {
+                "采集层：曾收到帧，随后断流"
+            } else {
+                "采集层：USB/UVC 已启动，但始终没有帧数据"
+            }
+        )
+    }
+
     private val previewDataCallback = object : IPreviewDataCallBack {
         override fun onPreviewData(data: ByteArray?, format: IPreviewDataCallBack.DataFormat) {
-            onPreviewFrameArrived()
+            if (data != null && data.isNotEmpty()) {
+                onPreviewFrameArrived(data, format)
+            }
         }
     }
 
@@ -644,84 +905,155 @@ class MainActivity : CameraActivity() {
         }
     }
 
-    private fun ensureRuntimePermissions() {
-        if (hasRuntimePermissions()) {
-            uiState = uiState.copy(statusText = "等待采集卡")
-            openCameraOnPermissionGranted()
+    private fun ensureCameraPermission() {
+        if (hasPermission(Manifest.permission.CAMERA)) {
+            Log.i(TAG, "Camera permission already granted; waiting for the base surface callback")
+            uiState = uiState.copy(
+                statusText = "正在检测采集卡",
+                diagnosticText = "应用层：相机权限已授权，等待 USB/UVC"
+            )
             return
         }
         uiState = uiState.copy(
             connectionState = DeviceConnectionState.Connecting,
-            statusText = "等待权限授权"
+            statusText = "等待相机权限授权",
+            diagnosticText = "应用层：等待相机权限"
         )
-        permissionLauncher.launch(requiredRuntimePermissions())
+        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
-    private fun openCameraOnPermissionGranted() {
+    private fun openCameraAfterPermissionGrant() {
         uiState = uiState.copy(
             connectionState = DeviceConnectionState.Connecting,
             statusText = "正在检测采集卡",
-            errorMessage = null
+            errorMessage = null,
+            diagnosticText = "应用层：相机权限已授权，等待 USB/UVC"
         )
-        if (::cameraView.isInitialized && cameraView.isAvailable) {
-            cameraClient?.openCamera(cameraView)
+        if (
+            ::cameraView.isInitialized &&
+            cameraView.isAvailable &&
+            cameraClient?.isCameraOpened() != true
+        ) {
+            Log.i(TAG, "Surface is already available after permission grant; opening camera once")
+            cameraClient?.openCamera(cameraView, false)
             refreshRenderSize()
         }
     }
 
     private fun refreshRenderSize() {
         if (!::cameraView.isInitialized) return
-        cameraView.post {
-            if (cameraView.width > 0 && cameraView.height > 0) {
-                cameraClient?.setRenderSize(cameraView.width, cameraView.height)
+        val client = cameraClient ?: return
+        val oldWidth = cameraView.width
+        val oldHeight = cameraView.height
+        client.getCameraRequest()?.let { request ->
+            cameraView.setAspectRatio(request.previewWidth, request.previewHeight)
+        }
+        cameraContainer.requestLayout()
+        cameraView.doOnLayout { view ->
+            if (view.width > 0 && view.height > 0) {
+                Log.i(
+                    TAG,
+                    "Render layout updated for ${screenOrientation.name}: " +
+                        "$oldWidth x $oldHeight -> ${view.width} x ${view.height}"
+                )
+                client.setRenderSize(view.width, view.height)
+                applyPreviewTransform(view.width, view.height)
             }
         }
     }
 
-    private fun hasRuntimePermissions(): Boolean {
-        return requiredRuntimePermissions().all { permission ->
-            ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+    private fun applyPreviewTransform(viewWidth: Int, viewHeight: Int) {
+        if (viewWidth <= 0 || viewHeight <= 0) return
+        val request = cameraClient?.getCameraRequest() ?: return
+        if (request.previewWidth <= 0 || request.previewHeight <= 0) return
+
+        val sourceAspect = request.previewWidth.toFloat() / request.previewHeight
+        val viewAspect = viewWidth.toFloat() / viewHeight
+        val baseScaleX: Float
+        val baseScaleY: Float
+        if (sourceAspect > viewAspect) {
+            baseScaleX = 1f
+            baseScaleY = viewAspect / sourceAspect
+        } else {
+            baseScaleX = sourceAspect / viewAspect
+            baseScaleY = 1f
         }
+
+        val scaleX = baseScaleX * previewZoom
+        val scaleY = baseScaleY * previewZoom
+        val contentWidth = viewWidth * scaleX
+        val contentHeight = viewHeight * scaleY
+        val maxPanX = maxOf(0f, (contentWidth - viewWidth) / 2f)
+        val maxPanY = maxOf(0f, (contentHeight - viewHeight) / 2f)
+        previewPanX = previewPanX.coerceIn(-maxPanX, maxPanX)
+        previewPanY = previewPanY.coerceIn(-maxPanY, maxPanY)
+
+        val centerX = viewWidth / 2f
+        val centerY = viewHeight / 2f
+        previewTransformMatrix.setValues(
+            floatArrayOf(
+                scaleX,
+                0f,
+                centerX * (1f - scaleX) + previewPanX,
+                0f,
+                scaleY,
+                centerY * (1f - scaleY) + previewPanY,
+                0f,
+                0f,
+                1f
+            )
+        )
+        cameraView.setTransform(previewTransformMatrix)
     }
 
-    private fun requiredRuntimePermissions(): Array<String> {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
-        } else {
-            emptyArray()
-        }
+    private fun hasPermission(permission: String): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun createDeviceConnectCallback(): IDeviceConnectCallBack {
         return object : IDeviceConnectCallBack {
             override fun onAttachDev(device: UsbDevice?) {
+                Log.i(TAG, "USB attached: ${usbDeviceSummary(device)}")
                 runOnUiThread {
+                    resetPreviewTransform()
+                    previewRecoveryAttempts = 0
+                    previewRecoveryInProgress = false
+                    cachedPreviewSizes = emptyList()
                     revealControls()
                     uiState = uiState.copy(
                         connectionState = DeviceConnectionState.Connecting,
                         statusText = "检测到采集卡",
                         deviceName = deviceLabel(device),
-                        errorMessage = null
+                        errorMessage = null,
+                        diagnosticText = "USB 层：设备已枚举，等待授权"
                     )
                 }
             }
 
             override fun onDetachDec(device: UsbDevice?) {
+                Log.w(TAG, "USB detached: ${usbDeviceSummary(device)}")
                 runOnUiThread {
+                    resetPreviewTransform()
+                    previewRecoveryAttempts = 0
+                    previewRecoveryInProgress = false
+                    cachedPreviewSizes = emptyList()
                     stopRecordingTicker()
                     stopPreviewFps()
-                    revealControls()
+                    showMainScreenChrome()
                     uiState = uiState.copy(
                         connectionState = DeviceConnectionState.Waiting,
                         statusText = "采集卡已拔出",
                         deviceName = deviceLabel(device),
                         isPreviewing = false,
-                        isRecording = false
+                        isRecording = false,
+                        diagnosticText = "USB 层：设备已物理拔出"
                     )
                 }
             }
 
             override fun onConnectDev(device: UsbDevice?, ctrlBlock: USBMonitor.UsbControlBlock?) {
+                Log.i(TAG, "USB permission granted: ${usbDeviceSummary(device)}")
                 runOnUiThread {
                     val details = collectUsbDetails(device)
                     uiState = uiState.copy(
@@ -730,43 +1062,55 @@ class MainActivity : CameraActivity() {
                         deviceName = details.deviceName,
                         previewSizeText = details.previewSizeText,
                         previewSizes = details.previewSizes,
-                        errorMessage = null
+                        errorMessage = null,
+                        diagnosticText = "USB 层：设备权限已授权，正在启动 UVC"
                     )
                 }
             }
 
             override fun onDisConnectDec(device: UsbDevice?, ctrlBlock: USBMonitor.UsbControlBlock?) {
+                Log.w(TAG, "USB disconnected: ${usbDeviceSummary(device)}")
                 runOnUiThread {
+                    resetPreviewTransform()
+                    previewRecoveryAttempts = 0
+                    previewRecoveryInProgress = false
+                    cachedPreviewSizes = emptyList()
                     stopRecordingTicker()
                     stopPreviewFps()
-                    revealControls()
+                    showMainScreenChrome()
                     uiState = uiState.copy(
                         connectionState = DeviceConnectionState.Waiting,
                         statusText = "采集卡连接已断开",
                         deviceName = deviceLabel(device),
                         isPreviewing = false,
-                        isRecording = false
+                        isRecording = false,
+                        diagnosticText = "USB 层：设备连接已断开"
                     )
                 }
             }
 
             override fun onCancelDev(device: UsbDevice?) {
+                Log.w(TAG, "USB permission cancelled: ${usbDeviceSummary(device)}")
                 runOnUiThread {
                     revealControls()
                     uiState = uiState.copy(
                         connectionState = DeviceConnectionState.Error,
                         statusText = "采集卡权限被取消",
                         deviceName = deviceLabel(device),
-                        errorMessage = "采集卡权限被取消"
+                        errorMessage = "采集卡权限被取消",
+                        diagnosticText = "USB 层：设备权限未授权"
                     )
                 }
             }
         }
     }
 
-    private fun collectUsbDetails(preferredDevice: UsbDevice? = null): UsbCameraDetails {
+    private fun collectUsbDetails(
+        preferredDevice: UsbDevice? = null,
+        refreshPreviewSizes: Boolean = false
+    ): UsbCameraDetails {
         val request = cameraClient?.getCameraRequest()
-        val sizes = detectPreviewSizes()
+        val sizes = if (refreshPreviewSizes) detectPreviewSizes() else cachedPreviewSizes
         val currentDevice = preferredDevice
             ?: uvcStrategy?.getCurrentDevice()
             ?: uvcStrategy?.getUsbDeviceList()?.firstOrNull()
@@ -782,6 +1126,12 @@ class MainActivity : CameraActivity() {
 
     private fun deviceLabel(device: UsbDevice?): String {
         return if (device == null) "采集卡" else "采集卡已连接"
+    }
+
+    private fun usbDeviceSummary(device: UsbDevice?): String {
+        if (device == null) return "unknown"
+        return "vid=0x${device.vendorId.toString(16)}, pid=0x${device.productId.toString(16)}, " +
+            "class=${device.deviceClass}, id=${device.deviceId}"
     }
 
     private fun localizeCameraMessage(message: String?, fallback: String): String {
@@ -922,6 +1272,7 @@ data class UsbCameraUiState(
     val isRecording: Boolean = false,
     val recordingSeconds: Long = 0L,
     val errorMessage: String? = null,
+    val diagnosticText: String = "应用层：等待初始化",
     val recordingFiles: List<RecordingFile> = emptyList()
 )
 
@@ -969,6 +1320,7 @@ private fun UsbCaptureScreen(
     functionMenuExpanded: Boolean,
     showSettings: Boolean,
     screenLocked: Boolean,
+    singleFingerPanEnabled: Boolean,
     controlsInteractionTick: Int,
     onThemeModeChange: (ThemeMode) -> Unit,
     onRecordClick: () -> Unit,
@@ -980,9 +1332,12 @@ private fun UsbCaptureScreen(
     onSettingsDismiss: () -> Unit,
     onExitClick: () -> Unit,
     onPreviewTap: () -> Unit,
+    onPreviewTransform: (Float, Float, Float, Float, Float) -> Unit,
     onAutoHideControls: () -> Unit,
     onToggleScreenLock: () -> Unit
 ) {
+    val currentSingleFingerPanEnabled = rememberUpdatedState(singleFingerPanEnabled)
+    val currentOnPreviewTransform = rememberUpdatedState(onPreviewTransform)
     LaunchedEffect(
         uiState.isPreviewing,
         controlsVisible,
@@ -1004,6 +1359,19 @@ private fun UsbCaptureScreen(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
+                    .previewTransformGestures(
+                        enabled = !screenLocked,
+                        singleFingerPanEnabled = { currentSingleFingerPanEnabled.value },
+                        onTransform = { zoom, panX, panY, centroidX, centroidY ->
+                            currentOnPreviewTransform.value(
+                                zoom,
+                                panX,
+                                panY,
+                                centroidX,
+                                centroidY
+                            )
+                        }
+                    )
                     .clickable(
                         interactionSource = tapInteractionSource,
                         indication = null,
@@ -1043,6 +1411,88 @@ private fun UsbCaptureScreen(
             onFrameRateSelected = onFrameRateSelected,
             onDismiss = onSettingsDismiss
         )
+    }
+}
+
+private fun Modifier.previewTransformGestures(
+    enabled: Boolean,
+    singleFingerPanEnabled: () -> Boolean,
+    onTransform: (Float, Float, Float, Float, Float) -> Unit
+): Modifier = pointerInput(enabled) {
+    if (!enabled) return@pointerInput
+    awaitEachGesture {
+        awaitFirstDown(requireUnconsumed = false)
+        val touchSlop = viewConfiguration.touchSlop
+        val touchSlopSquared = touchSlop * touchSlop
+        var accumulatedPanX = 0f
+        var accumulatedPanY = 0f
+        var singleFingerPanActive = false
+        var hadMultiTouch = false
+        var hasPressedPointers: Boolean
+        do {
+            val event = awaitPointerEvent()
+            hasPressedPointers = event.changes.any { it.pressed }
+            val pressedChanges = event.changes.filter { it.pressed }
+            when {
+                pressedChanges.size >= 2 -> {
+                    hadMultiTouch = true
+                    singleFingerPanActive = false
+                    accumulatedPanX = 0f
+                    accumulatedPanY = 0f
+                    val zoomChange = event.calculateZoom()
+                    val panChange = event.calculatePan()
+                    val centroid = event.calculateCentroid()
+                    onTransform(
+                        zoomChange,
+                        panChange.x,
+                        panChange.y,
+                        centroid.x,
+                        centroid.y
+                    )
+                    event.changes.forEach { it.consume() }
+                }
+
+                pressedChanges.size == 1 && singleFingerPanEnabled() -> {
+                    val change = pressedChanges.first()
+                    val deltaX = change.position.x - change.previousPosition.x
+                    val deltaY = change.position.y - change.previousPosition.y
+                    if (hadMultiTouch) {
+                        singleFingerPanActive = true
+                    }
+
+                    var panX = deltaX
+                    var panY = deltaY
+                    if (!singleFingerPanActive) {
+                        accumulatedPanX += deltaX
+                        accumulatedPanY += deltaY
+                        val distanceSquared = accumulatedPanX * accumulatedPanX +
+                            accumulatedPanY * accumulatedPanY
+                        if (distanceSquared >= touchSlopSquared) {
+                            singleFingerPanActive = true
+                            panX = accumulatedPanX
+                            panY = accumulatedPanY
+                        }
+                    }
+
+                    if (singleFingerPanActive && (panX != 0f || panY != 0f)) {
+                        onTransform(
+                            1f,
+                            panX,
+                            panY,
+                            change.position.x,
+                            change.position.y
+                        )
+                        change.consume()
+                    }
+                }
+
+                else -> {
+                    singleFingerPanActive = false
+                    accumulatedPanX = 0f
+                    accumulatedPanY = 0f
+                }
+            }
+        } while (hasPressedPointers)
     }
 }
 
@@ -1421,6 +1871,7 @@ private fun SettingsPanel(
                     InfoRow("预览", uiState.previewSizeText)
                     InfoRow("方向", screenOrientation.label)
                     InfoRow("状态", uiState.statusText)
+                    InfoRow("诊断", uiState.diagnosticText)
                     ResolutionSelector(
                         options = uiState.previewSizes,
                         current = uiState.previewSizeText,
