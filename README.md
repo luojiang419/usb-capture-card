@@ -5,7 +5,7 @@
 当前版本：`1.4.0`  
 应用包名：`com.codex.usbcapture`  
 最低系统版本：Android 6.0，API 23  
-发布 APK：见 GitHub Releases 中的 `USB-Capture-Card-v1.4.0.apk`
+发布 APK：见 GitHub Releases 中最新标签对应的 `USB-Capture-Card-v版本号.apk`
 
 ## 主要功能
 
@@ -27,7 +27,7 @@
 
 ## 使用方式
 
-1. 在 GitHub Releases 下载最新的 `USB-Capture-Card-v1.4.0.apk`。
+1. 在 GitHub Releases 下载最新标签对应的 `USB-Capture-Card-v版本号.apk`。
 2. 将 APK 安装到支持 USB Host 的 Android 手机或平板。
 3. 使用 OTG 转接线连接 USB/HDMI 采集卡。
 4. 首次连接时授予 USB 设备权限、相机权限和录音权限。
@@ -134,7 +134,7 @@ macOS / Linux：
 app/build/outputs/apk/debug/USB采集卡.apk
 ```
 
-说明：本地构建产物使用中文文件名 `USB采集卡.apk`；GitHub Release 中使用更稳定的英文资产名 `USB-Capture-Card-v1.4.0.apk`。
+说明：本地构建产物使用中文文件名 `USB采集卡.apk`；GitHub Release 中使用更稳定的英文资产名 `USB-Capture-Card-v版本号.apk`。
 
 ## 权限说明
 
@@ -163,13 +163,22 @@ app/build/outputs/apk/debug/USB采集卡.apk
 
 ## 发布流程
 
-当前项目使用 GitHub Releases 发布 APK：
+当前项目已接入 GitHub Actions 自动发布：
 
-1. 更新版本号。
-2. 执行 `.\gradlew.bat :app:assembleDebug`。
-3. 确认 `app/build/outputs/apk/debug/USB采集卡.apk` 存在。
-4. 创建版本标签，例如 `v1.4.0`。
-5. 将 APK 上传到对应 GitHub Release。
+1. 日常开发时，`push` 到 `main` 会自动构建 Debug APK，并上传到 Actions Artifacts。
+2. 需要正式挂到 GitHub Releases 时，先更新版本号并推送对应代码到 `main`。
+3. 创建版本标签，例如 `v1.4.1`：
+
+```bash
+git tag v1.4.1
+git push origin v1.4.1
+```
+
+4. GitHub Actions 会自动：
+   - 构建 `app/build/outputs/apk/debug/USB采集卡.apk`
+   - 复制为 Release 资产名 `USB-Capture-Card-v1.4.1.apk`
+   - 创建或更新对应标签的 GitHub Release
+5. 发布完成后，可在 Releases 页面直接下载 APK。
 
 ## 许可证
 

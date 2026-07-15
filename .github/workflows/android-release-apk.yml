@@ -1,0 +1,88 @@
+name: Android Release APK
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android platform 36
+        run: sdkmanager "platforms;android-36"
+
+      - name: Prepare local.properties for CI
+        shell: bash
+        run: |
+          SDK_PATH="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          if [ -z "$SDK_PATH" ]; then
+            echo "ANDROID_SDK_ROOT is not available"
+            exit 1
+          fi
+          printf "sdk.dir=%s\n" "$SDK_PATH" > local.properties
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Ensure Gradle wrapper is executable
+        run: chmod +x ./gradlew
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Prepare release asset
+        id: asset
+        shell: bash
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          RELEASE_APK="USB-Capture-Card-${TAG_NAME}.apk"
+          RELEASE_APK_PATH="${RUNNER_TEMP}/${RELEASE_APK}"
+          cp "app/build/outputs/apk/debug/USB采集卡.apk" "${RELEASE_APK_PATH}"
+          echo "release_apk=${RELEASE_APK}" >> "${GITHUB_OUTPUT}"
+          echo "release_apk_path=${RELEASE_APK_PATH}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: usb-capture-release-apk
+          path: ${{ steps.asset.outputs.release_apk_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          RELEASE_APK_PATH: ${{ steps.asset.outputs.release_apk_path }}
+        shell: bash
+        run: |
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" "${RELEASE_APK_PATH}" --clobber
+            gh release edit "${TAG_NAME}" --title "USB采集卡 ${TAG_NAME}"
+          else
+            gh release create "${TAG_NAME}" "${RELEASE_APK_PATH}" \
+              --title "USB采集卡 ${TAG_NAME}" \
+              --notes "Automated APK release for ${TAG_NAME}."
+          fi
