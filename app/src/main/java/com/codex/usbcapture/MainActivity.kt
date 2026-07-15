@@ -6,12 +6,14 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Matrix
 import android.hardware.usb.UsbDevice
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
@@ -67,12 +69,14 @@ import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Usb
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -107,6 +111,7 @@ import androidx.core.view.doOnLayout
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
 import com.jiangdg.ausbc.CameraClient
 import com.jiangdg.ausbc.base.CameraActivity
 import com.jiangdg.ausbc.camera.CameraUvcStrategy
@@ -122,11 +127,13 @@ import com.jiangdg.ausbc.widget.AspectRatioTextureView
 import com.jiangdg.ausbc.widget.IAspectRatio
 import com.serenegiant.usb.USBMonitor
 import java.io.File
+import java.text.DecimalFormat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 private const val DEFAULT_FRAME_RATE = 30
 private const val CONTROLS_AUTO_HIDE_MS = 3000L
@@ -175,6 +182,15 @@ class MainActivity : CameraActivity() {
     private var controlsInteractionTick by mutableStateOf(0)
     private var screenOrientation by mutableStateOf(ScreenOrientation.Portrait)
     private var uiState by mutableStateOf(UsbCameraUiState())
+    private val appUpdateManager by lazy { AppUpdateManager(this) }
+    private var availableAppUpdate by mutableStateOf<AppUpdateInfo?>(null)
+    private var showAppUpdateDialog by mutableStateOf(false)
+    private var isCheckingAppUpdate by mutableStateOf(false)
+    private var isDownloadingAppUpdate by mutableStateOf(false)
+    private var appUpdateStatusMessage by mutableStateOf<String?>(null)
+    private var appUpdateProgressText by mutableStateOf<String?>(null)
+    private var downloadedAppUpdatePath by mutableStateOf<String?>(null)
+    private var pendingInstallApkPath: String? = null
     private val cameraPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -207,6 +223,17 @@ class MainActivity : CameraActivity() {
             )
         }
     }
+    private val unknownSourcesPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        val pendingPath = pendingInstallApkPath ?: return@registerForActivityResult
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()) {
+            installDownloadedApk(File(pendingPath))
+        } else {
+            showAppUpdateDialog = true
+            appUpdateStatusMessage = "请允许当前应用安装更新包后，再点击“安装更新”。"
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         themeMode = loadThemeMode()
@@ -216,6 +243,7 @@ class MainActivity : CameraActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         onBackPressedDispatcher.addCallback(this, createBackCallback())
         refreshRecordingFiles()
+        requestAppUpdateCheck(userInitiated = false)
         ensureCameraPermission()
         enterImmersiveMode()
     }
@@ -259,18 +287,29 @@ class MainActivity : CameraActivity() {
                         controlsVisible = showControls,
                         functionMenuExpanded = showFunctionMenu,
                         showSettings = showSettings,
+                        showAppUpdateDialog = showAppUpdateDialog,
                         screenLocked = isScreenLocked,
                         singleFingerPanEnabled = isPreviewZoomed,
                         controlsInteractionTick = controlsInteractionTick,
+                        updateInfo = availableAppUpdate,
+                        isCheckingAppUpdate = isCheckingAppUpdate,
+                        isDownloadingAppUpdate = isDownloadingAppUpdate,
+                        appUpdateStatusMessage = appUpdateStatusMessage,
+                        appUpdateProgressText = appUpdateProgressText,
+                        updateReadyToInstall = !downloadedAppUpdatePath.isNullOrBlank(),
                         onThemeModeChange = ::switchTheme,
                         onRecordClick = ::handleRecordClick,
                         onResolutionSelected = ::updateResolution,
                         onAutoDetectResolutions = ::autoDetectPreviewSizes,
                         onFrameRateSelected = ::updateFrameRate,
                         onFunctionMenuExpandedChange = ::setFunctionMenuExpanded,
+                        onCheckAppUpdate = { requestAppUpdateCheck(userInitiated = true) },
                         onSettingsClick = ::showCaptureSettings,
                         onSettingsDismiss = ::dismissCaptureSettings,
                         onExitClick = ::exitCaptureScreen,
+                        onAppUpdateDismiss = ::dismissAppUpdateDialog,
+                        onDownloadAppUpdate = ::downloadAvailableUpdate,
+                        onInstallAppUpdate = ::installDownloadedUpdate,
                         onPreviewTap = ::handlePreviewTap,
                         onPreviewTransform = ::handlePreviewTransform,
                         onAutoHideControls = ::autoHideControls,
@@ -668,6 +707,159 @@ class MainActivity : CameraActivity() {
         } else {
             showControls = true
             markControlsInteraction()
+        }
+    }
+
+    private fun requestAppUpdateCheck(userInitiated: Boolean) {
+        if (isCheckingAppUpdate || isDownloadingAppUpdate) return
+        isCheckingAppUpdate = true
+        appUpdateProgressText = null
+        if (userInitiated) {
+            availableAppUpdate = null
+            downloadedAppUpdatePath = null
+            appUpdateStatusMessage = "正在检查 GitHub 最新版本..."
+            showAppUpdateDialog = true
+        }
+
+        lifecycleScope.launch {
+            runCatching { appUpdateManager.checkLatest() }
+                .onSuccess { result ->
+                    if (result.hasUpdate && result.updateInfo != null) {
+                        availableAppUpdate = result.updateInfo
+                        downloadedAppUpdatePath = null
+                        appUpdateStatusMessage = "发现新版本 v${result.latestVersion}，可以直接下载并安装更新。"
+                        showAppUpdateDialog = true
+                    } else if (userInitiated) {
+                        availableAppUpdate = null
+                        downloadedAppUpdatePath = null
+                        appUpdateStatusMessage = "当前已是最新版本 v${result.currentVersion}。"
+                        showAppUpdateDialog = true
+                    }
+                }
+                .onFailure { error ->
+                    Log.w(TAG, "App update check failed", error)
+                    if (userInitiated) {
+                        availableAppUpdate = null
+                        downloadedAppUpdatePath = null
+                        appUpdateStatusMessage = "检查更新失败：${error.message ?: "请稍后重试"}"
+                        showAppUpdateDialog = true
+                    }
+                }
+            isCheckingAppUpdate = false
+        }
+    }
+
+    private fun downloadAvailableUpdate() {
+        val updateInfo = availableAppUpdate ?: return
+        if (isDownloadingAppUpdate) return
+        isDownloadingAppUpdate = true
+        downloadedAppUpdatePath = null
+        appUpdateStatusMessage = "正在下载 v${updateInfo.latestVersion} 更新包..."
+        appUpdateProgressText = "准备下载 ${updateInfo.asset.name}"
+        showAppUpdateDialog = true
+
+        lifecycleScope.launch {
+            runCatching {
+                appUpdateManager.downloadUpdate(updateInfo) { received, total ->
+                    runOnUiThread {
+                        appUpdateProgressText = formatUpdateProgress(received, total)
+                    }
+                }
+            }.onSuccess { apkFile ->
+                downloadedAppUpdatePath = apkFile.absolutePath
+                appUpdateStatusMessage = "更新包已下载完成，点击“安装更新”继续。"
+                appUpdateProgressText = "已下载到：${apkFile.name}"
+                showAppUpdateDialog = true
+            }.onFailure { error ->
+                Log.e(TAG, "App update download failed", error)
+                appUpdateStatusMessage = "下载更新失败：${error.message ?: "请稍后重试"}"
+                appUpdateProgressText = null
+                showAppUpdateDialog = true
+            }
+            isDownloadingAppUpdate = false
+        }
+    }
+
+    private fun installDownloadedUpdate() {
+        val apkPath = downloadedAppUpdatePath
+        if (apkPath.isNullOrBlank()) {
+            appUpdateStatusMessage = "更新包尚未下载完成，请先下载更新。"
+            showAppUpdateDialog = true
+            return
+        }
+        installDownloadedApk(File(apkPath))
+    }
+
+    private fun installDownloadedApk(apkFile: File) {
+        if (!apkFile.exists()) {
+            downloadedAppUpdatePath = null
+            appUpdateStatusMessage = "更新包不存在，请重新下载。"
+            showAppUpdateDialog = true
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+            pendingInstallApkPath = apkFile.absolutePath
+            appUpdateStatusMessage = "请先允许当前应用安装更新包。"
+            showAppUpdateDialog = true
+            unknownSourcesPermissionLauncher.launch(
+                Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:$packageName")
+                )
+            )
+            return
+        }
+
+        val apkUri = FileProvider.getUriForFile(
+            this,
+            "$packageName.fileprovider",
+            apkFile
+        )
+        val installIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(apkUri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching {
+            startActivity(installIntent)
+            appUpdateStatusMessage = "已打开系统安装界面，请按提示完成更新。"
+            showAppUpdateDialog = true
+        }.onFailure { error ->
+            Log.e(TAG, "Open package installer failed", error)
+            appUpdateStatusMessage = "无法打开系统安装界面：${error.message ?: "请手动安装"}"
+            showAppUpdateDialog = true
+        }
+    }
+
+    private fun dismissAppUpdateDialog() {
+        if (isDownloadingAppUpdate) return
+        showAppUpdateDialog = false
+        if (availableAppUpdate == null) {
+            appUpdateStatusMessage = null
+            appUpdateProgressText = null
+        }
+    }
+
+    private fun formatUpdateProgress(received: Long, total: Long): String {
+        if (total > 0L) {
+            val percent = ((received * 100L) / total).coerceIn(0L, 100L)
+            return "正在下载更新：$percent%（${formatFileSize(received)} / ${formatFileSize(total)}）"
+        }
+        return "正在下载更新：${formatFileSize(received)}"
+    }
+
+    private fun formatFileSize(bytes: Long): String {
+        if (bytes <= 0L) return "0 B"
+        val kilo = 1024.0
+        val mega = kilo * 1024.0
+        val giga = mega * 1024.0
+        val formatter = DecimalFormat("0.0")
+        return when {
+            bytes >= giga -> "${formatter.format(bytes / giga)} GB"
+            bytes >= mega -> "${formatter.format(bytes / mega)} MB"
+            bytes >= kilo -> "${formatter.format(bytes / kilo)} KB"
+            else -> "$bytes B"
         }
     }
 
@@ -1319,18 +1511,29 @@ private fun UsbCaptureScreen(
     controlsVisible: Boolean,
     functionMenuExpanded: Boolean,
     showSettings: Boolean,
+    showAppUpdateDialog: Boolean,
     screenLocked: Boolean,
     singleFingerPanEnabled: Boolean,
     controlsInteractionTick: Int,
+    updateInfo: AppUpdateInfo?,
+    isCheckingAppUpdate: Boolean,
+    isDownloadingAppUpdate: Boolean,
+    appUpdateStatusMessage: String?,
+    appUpdateProgressText: String?,
+    updateReadyToInstall: Boolean,
     onThemeModeChange: (ThemeMode) -> Unit,
     onRecordClick: () -> Unit,
     onResolutionSelected: (PreviewOption) -> Unit,
     onAutoDetectResolutions: () -> Unit,
     onFrameRateSelected: (Int) -> Unit,
     onFunctionMenuExpandedChange: (Boolean) -> Unit,
+    onCheckAppUpdate: () -> Unit,
     onSettingsClick: () -> Unit,
     onSettingsDismiss: () -> Unit,
     onExitClick: () -> Unit,
+    onAppUpdateDismiss: () -> Unit,
+    onDownloadAppUpdate: () -> Unit,
+    onInstallAppUpdate: () -> Unit,
     onPreviewTap: () -> Unit,
     onPreviewTransform: (Float, Float, Float, Float, Float) -> Unit,
     onAutoHideControls: () -> Unit,
@@ -1389,8 +1592,10 @@ private fun UsbCaptureScreen(
             FunctionOverlay(
                 uiState = uiState,
                 functionMenuExpanded = functionMenuExpanded,
+                isCheckingAppUpdate = isCheckingAppUpdate,
                 onFunctionMenuExpandedChange = onFunctionMenuExpandedChange,
                 onRecordClick = onRecordClick,
+                onCheckAppUpdate = onCheckAppUpdate,
                 onSettingsClick = onSettingsClick,
                 onExitClick = onExitClick
             )
@@ -1410,6 +1615,18 @@ private fun UsbCaptureScreen(
             onAutoDetectResolutions = onAutoDetectResolutions,
             onFrameRateSelected = onFrameRateSelected,
             onDismiss = onSettingsDismiss
+        )
+        AppUpdateDialog(
+            visible = showAppUpdateDialog,
+            updateInfo = updateInfo,
+            isChecking = isCheckingAppUpdate,
+            isDownloading = isDownloadingAppUpdate,
+            statusMessage = appUpdateStatusMessage,
+            progressText = appUpdateProgressText,
+            readyToInstall = updateReadyToInstall,
+            onDismiss = onAppUpdateDismiss,
+            onDownload = onDownloadAppUpdate,
+            onInstall = onInstallAppUpdate
         )
     }
 }
@@ -1500,8 +1717,10 @@ private fun Modifier.previewTransformGestures(
 private fun FunctionOverlay(
     uiState: UsbCameraUiState,
     functionMenuExpanded: Boolean,
+    isCheckingAppUpdate: Boolean,
     onFunctionMenuExpandedChange: (Boolean) -> Unit,
     onRecordClick: () -> Unit,
+    onCheckAppUpdate: () -> Unit,
     onSettingsClick: () -> Unit,
     onExitClick: () -> Unit
 ) {
@@ -1514,8 +1733,10 @@ private fun FunctionOverlay(
         FunctionMenuButton(
             uiState = uiState,
             expanded = functionMenuExpanded,
+            isCheckingAppUpdate = isCheckingAppUpdate,
             onExpandedChange = onFunctionMenuExpandedChange,
             onRecordClick = onRecordClick,
+            onCheckAppUpdate = onCheckAppUpdate,
             onSettingsClick = onSettingsClick,
             onExitClick = onExitClick
         )
@@ -1526,8 +1747,10 @@ private fun FunctionOverlay(
 private fun FunctionMenuButton(
     uiState: UsbCameraUiState,
     expanded: Boolean,
+    isCheckingAppUpdate: Boolean,
     onExpandedChange: (Boolean) -> Unit,
     onRecordClick: () -> Unit,
+    onCheckAppUpdate: () -> Unit,
     onSettingsClick: () -> Unit,
     onExitClick: () -> Unit
 ) {
@@ -1572,6 +1795,15 @@ private fun FunctionMenuButton(
                 onClick = {
                     onExpandedChange(false)
                     onRecordClick()
+                }
+            )
+            DropdownMenuItem(
+                text = { Text(if (isCheckingAppUpdate) "正在检查更新..." else "检查更新") },
+                leadingIcon = { Icon(Icons.Rounded.SystemUpdate, contentDescription = null) },
+                enabled = !isCheckingAppUpdate,
+                onClick = {
+                    onExpandedChange(false)
+                    onCheckAppUpdate()
                 }
             )
             DropdownMenuItem(
@@ -1895,6 +2127,118 @@ private fun SettingsPanel(
             }
         }
     }
+}
+
+@Composable
+private fun AppUpdateDialog(
+    visible: Boolean,
+    updateInfo: AppUpdateInfo?,
+    isChecking: Boolean,
+    isDownloading: Boolean,
+    statusMessage: String?,
+    progressText: String?,
+    readyToInstall: Boolean,
+    onDismiss: () -> Unit,
+    onDownload: () -> Unit,
+    onInstall: () -> Unit
+) {
+    if (!visible) return
+
+    AlertDialog(
+        onDismissRequest = {
+            if (!isDownloading) {
+                onDismiss()
+            }
+        },
+        title = {
+            Text(
+                text = updateInfo?.let { "发现新版本 v${it.latestVersion}" } ?: "应用更新",
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.verticalScroll(rememberScrollState())
+            ) {
+                statusMessage?.let {
+                    Text(
+                        text = it,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+                if (isChecking) {
+                    Text(
+                        text = "正在检查 GitHub 最新 Release，请稍候。",
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
+                        fontSize = 13.sp
+                    )
+                }
+                updateInfo?.let { info ->
+                    InfoRow("当前版本", "v${info.currentVersion}")
+                    InfoRow("最新版本", "v${info.latestVersion}")
+                    InfoRow("安装包", info.asset.name)
+                    if (info.releaseNotes.isNotBlank()) {
+                        Text(
+                            text = "更新说明",
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = info.releaseNotes,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f),
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+                progressText?.let {
+                    Text(
+                        text = it,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontSize = 13.sp
+                    )
+                }
+                if (readyToInstall) {
+                    Text(
+                        text = "下载完成后会打开系统安装界面，请按系统提示完成更新。",
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
+                        fontSize = 13.sp
+                    )
+                }
+            }
+        },
+        dismissButton = {
+            if (!isDownloading) {
+                TextButton(onClick = onDismiss) {
+                    Text(if (readyToInstall) "稍后" else "关闭")
+                }
+            }
+        },
+        confirmButton = {
+            when {
+                readyToInstall -> {
+                    FilledTonalButton(onClick = onInstall) {
+                        Text("安装更新")
+                    }
+                }
+
+                updateInfo != null -> {
+                    FilledTonalButton(
+                        onClick = onDownload,
+                        enabled = !isChecking && !isDownloading
+                    ) {
+                        Text(if (isDownloading) "下载中..." else "下载更新")
+                    }
+                }
+
+                else -> {
+                    TextButton(onClick = onDismiss) {
+                        Text("知道了")
+                    }
+                }
+            }
+        }
+    )
 }
 
 @Composable

@@ -3,4 +3,10 @@
     <external-files-path
         name="usb_capture_movies"
         path="Movies/UsbCapture/" />
+    <external-files-path
+        name="usb_capture_updates"
+        path="Download/updates/" />
+    <files-path
+        name="usb_capture_internal_updates"
+        path="updates/" />
 </paths>

@@ -13,12 +13,13 @@ android {
         applicationId = "com.codex.usbcapture"
         minSdk = 23
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.4.1"
+        versionCode = 7
+        versionName = "1.4.2"
     }
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     composeOptions {
