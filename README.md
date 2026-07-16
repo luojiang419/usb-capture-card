@@ -2,7 +2,8 @@
 
 一个面向 Android 设备的 USB/UVC 采集卡预览与录制应用。项目使用 Kotlin、Jetpack Compose 和 AUSBC 3.2.7 构建，目标是让手机或平板连接 USB 采集卡后，可以快速查看 HDMI/采集画面、切换采集参数并录制视频。
 
-当前版本：`1.4.4`  
+当前版本：`1.4.5`
+
 应用包名：`com.codex.usbcapture`  
 最低系统版本：Android 6.0，API 23  
 发布 APK：见 GitHub Releases 中最新标签对应的 `USB-Capture-Card-v版本号.apk`
@@ -150,7 +151,7 @@ app/build/outputs/apk/debug/USB采集卡.apk
 
 ## 当前版本能力
 
-`1.4.4` 版本包含以下重点优化：
+`1.4.5` 版本包含以下重点优化：
 
 - 左上角只保留功能按钮，不再重复显示“等待采集卡”状态胶囊。
 - 功能按钮内增加状态指示灯。
@@ -166,7 +167,7 @@ app/build/outputs/apk/debug/USB采集卡.apk
 - `1.4.1` 及更早版本还不包含这套应用内更新逻辑，因此首次切入自动更新能力时，仍需要手动安装一次 `1.4.2` 或更高版本。
 - `1.4.2` / `1.4.3` 这两个历史测试版使用的是临时签名，无法直接覆盖升级到固定签名版；需要先手动卸载旧测试版，再安装 `1.4.4` 作为新的稳定升级基线。
 - 需要真机和真实 USB/UVC 采集卡验证完整链路，普通模拟器无法验证 USB 采集功能。
-- 当前发布的是 Debug APK，适合测试和内部使用；正式分发前建议配置 Release 签名、混淆和版本发布流程。
+- GitHub Release 使用固定证书签名的 Release APK；签名文件和密码保存在仓库 Actions Secrets 中，不提交到源码。
 
 ## 发布流程
 
@@ -182,7 +183,7 @@ git push origin v1.4.1
 ```
 
 4. GitHub Actions 会自动：
-   - 构建 `app/build/outputs/apk/debug/USB采集卡.apk`
+   - 使用固定证书构建 `app/build/outputs/apk/release/USB采集卡.apk`
    - 复制为 Release 资产名 `USB-Capture-Card-v1.4.1.apk`
    - 创建或更新对应标签的 GitHub Release
 5. 发布完成后，可在 Releases 页面直接下载 APK。
